@@ -1,0 +1,59 @@
+# --- FastAPI & server ---
+fastapi>=0.110,<0.115
+uvicorn[standard]>=0.23
+
+# --- Database (SQLAlchemy + Postgres driver) ---
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+
+# --- LangChain core + split packages (kept <0.3 for legacy imports) ---
+langchain>=0.2.10,<0.3.0 ; python_version < "3.13"
+langchain-core>=0.2.10,<0.3.0 ; python_version < "3.13"
+langchain-openai>=0.1.7,<0.2.0 ; python_version < "3.13"
+langchain-text-splitters>=0.2.2,<0.3.0 ; python_version < "3.13"
+langchain-experimental>=0.0.57,<0.3.0 ; python_version < "3.13"
+langchain-pinecone>=0.2.3,<0.3.0 ; python_version < "3.13"
+langchain-community>=0.2.0,<0.3.0 ; python_version < "3.13"
+
+# --- LangChain core + split packages (Python 3.13+ compatible pins) ---
+langchain>=0.3.0,<0.4.0 ; python_version >= "3.13"
+langchain-core>=0.3.0,<0.4.0 ; python_version >= "3.13"
+langchain-openai>=0.2.0,<0.3.0 ; python_version >= "3.13"
+langchain-text-splitters>=0.3.0,<0.4.0 ; python_version >= "3.13"
+langchain-experimental>=0.3.0,<0.4.0 ; python_version >= "3.13"
+langchain-pinecone>=0.2.0,<0.3.0 ; python_version >= "3.13"
+langchain-community>=0.3.0,<0.4.0 ; python_version >= "3.13"
+
+# --- Model providers / SDKs used by LangChain integrations ---
+openai>=1.30.0
+
+# --- Pinecone (vector DB SDK) ---
+# Note: Do NOT install pinecone-client or pinecone-plugin-inference separately
+# These are deprecated and will cause conflicts
+pinecone>=6.0.0,<8.0.0
+
+# --- YouTube transcripts ---
+youtube-transcript-api>=0.6.1
+
+# --- Gradio UI ---
+# gradio>=4.0.0
+
+# --- Authentication & security ---
+bcrypt>=4.0.0
+PyJWT>=2.8.0
+python-multipart>=0.0.7
+
+# --- Database migrations ---
+alembic>=1.13.0
+
+# --- Utilities ---
+python-dotenv>=1.0.0
+langdetect>=1.0.9
+duckduckgo-search>=4.0.0
+ddgs>=9.0.0
+
+# --- Version-specific overrides ---
+# Python <3.13 continues shipping with the legacy numpy line because wheels exist.
+numpy>=1.26.4,<2.0.0 ; python_version < "3.13"
+# Python 3.13+ requires numpy 2.x where wheels are published.
+numpy>=2.0.0 ; python_version >= "3.13"

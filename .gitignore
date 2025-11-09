@@ -1,0 +1,100 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+myvenv/
+venv/
+ENV/
+env/
+.venv
+
+# Environment Variables (NEVER COMMIT!)
+.env
+.env.*
+!.env.example
+!.env.*.template
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Backups
+local_backup_*.json
+local_backup_*.dump
+*.backup
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Project specific files to exclude
+patients.json
+local_data.sql
+schema.sql
+refrence.py
+
+# Test and migration scripts (not needed in repo)
+test_*.py
+complete_neon_migration.py
+verify_*.py
+import_*.py
+setup_*.sh
+
+# Documentation files (session-specific, not for repo)
+# Keep only README.md and env.example
+AGENT_CONTEXT_*.md
+AUTH_README.md
+CREDENTIAL_*.md
+DATABASE_*.md
+DEPLOYMENT_*.md
+DOCKER_*.md
+FIXES_*.md
+HTTP500_*.md
+IMPLEMENTATION_*.md
+LOCAL_*.md
+NEONDB_*.md
+OAUTH2_*.md
+POSTMAN_*.md
+QUICK_START.md
+SESSION_*.md
+SETUP.md
+STARTUP_*.md
+USER_*.md
+README_NEONDB.md

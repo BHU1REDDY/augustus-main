@@ -27,11 +27,22 @@ Setup Instructions:
 import os
 from datetime import datetime, timedelta
 from typing import Optional, List
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, ARRAY, ForeignKey, CheckConstraint
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Boolean,
+    DateTime,
+    Text,
+    ForeignKey,
+    CheckConstraint,
+)
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import sessionmaker, Session
 import uuid
+from sqlalchemy.engine import make_url
+from sqlalchemy import JSON
 
 # Database URL from environment variable
 # MUST be set - no default to prevent deployment errors
@@ -39,27 +50,53 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     raise ValueError(
-        "❌ DATABASE_URL environment variable is required!\n"
+        "[ERROR] DATABASE_URL environment variable is required!\n"
         "   Set it in .env file for your database connection.\n"
         "   Example: postgresql://user:pass@host:5432/dbname?sslmode=require"
     )
 
-# Production-ready engine configuration
-# Optimized for NeonDB and cloud databases with auto-suspend
-IS_PRODUCTION = os.getenv("ENVIRONMENT", "development") == "production"
+parsed_url = make_url(DATABASE_URL)
+DB_BACKEND = parsed_url.get_backend_name()
+IS_SQLITE = DB_BACKEND == "sqlite"
 
-engine = create_engine(
-    DATABASE_URL,
-    echo=not IS_PRODUCTION,  # Only log SQL in development
-    pool_size=10,  # Connection pool size
-    max_overflow=20,  # Max overflow connections
-    pool_pre_ping=True,  # CRITICAL: Test connections before use (prevents stale connections after NeonDB auto-suspend)
-    pool_recycle=300,  # Recycle connections after 5 minutes (NeonDB auto-suspends after 5 min inactivity)
-    connect_args={
-        "connect_timeout": 10,
-        "options": "-c timezone=utc"
-    }
-)
+if IS_SQLITE:
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        echo=False,
+    )
+    UUID_TYPE = String(36)
+    EXTRA_DATA_TYPE = JSON
+    SCOPES_TYPE = JSON
+
+    def uuid_default() -> str:
+        return str(uuid.uuid4())
+else:
+    from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
+
+    # Production-ready engine configuration
+    # Optimized for NeonDB and cloud databases with auto-suspend
+    IS_PRODUCTION = os.getenv("ENVIRONMENT", "development") == "production"
+
+    engine = create_engine(
+        DATABASE_URL,
+        echo=not IS_PRODUCTION,  # Only log SQL in development
+        pool_size=10,  # Connection pool size
+        max_overflow=20,  # Max overflow connections
+        pool_pre_ping=True,  # Test connections before use
+        pool_recycle=300,  # Recycle connections after 5 minutes
+        connect_args={
+            "connect_timeout": 10,
+            "options": "-c timezone=utc",
+        },
+    )
+
+    UUID_TYPE = UUID(as_uuid=True)
+    EXTRA_DATA_TYPE = JSONB
+    SCOPES_TYPE = ARRAY(String)
+
+    def uuid_default():
+        return uuid.uuid4()
 
 # Create SessionLocal class
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -71,12 +108,12 @@ class User(Base):
     """User model for authentication system"""
     __tablename__ = "users"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(UUID_TYPE, primary_key=True, default=uuid_default)
     username = Column(String(50), unique=True, index=True, nullable=False)
     email = Column(String(100), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
-    scopes = Column(ARRAY(String), default=["read", "write"], nullable=False)
+    scopes = Column(SCOPES_TYPE, default=lambda: ["read", "write"], nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
@@ -92,8 +129,8 @@ class UserSession(Base):
     __tablename__ = "user_sessions"
     
     # Identity
-    session_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    session_id = Column(UUID_TYPE, primary_key=True, default=uuid_default)
+    user_id = Column(UUID_TYPE, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
     
     # Video context tracking (critical for follow-up questions)
     current_video_id = Column(String(100), nullable=True)
@@ -117,8 +154,8 @@ class Message(Base):
     __tablename__ = "messages"
     
     # Identity
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    session_id = Column(UUID(as_uuid=True), ForeignKey('user_sessions.session_id', ondelete='CASCADE'), nullable=False)
+    id = Column(UUID_TYPE, primary_key=True, default=uuid_default)
+    session_id = Column(UUID_TYPE, ForeignKey('user_sessions.session_id', ondelete='CASCADE'), nullable=False)
     
     # Ordering (critical for conversation flow)
     message_index = Column(Integer, nullable=False)
@@ -135,7 +172,7 @@ class Message(Base):
     tool_success = Column(Boolean, nullable=True)
     
     # Flexible metadata (using extra_data to avoid SQLAlchemy reserved word)
-    extra_data = Column(JSONB, default={}, nullable=False)
+    extra_data = Column(EXTRA_DATA_TYPE, default=dict, nullable=False)
     
     # Timestamp
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

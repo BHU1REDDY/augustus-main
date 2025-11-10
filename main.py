@@ -596,6 +596,15 @@ def signin(user_data: UserLogin, db: Session = Depends(get_db)):
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
 
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def api_auth_login(user_data: UserLogin, db: Session = Depends(get_db)):
+    """
+    JSON-based login endpoint used by the frontend bridge.
+    Mirrors the behaviour of /signin but under the /api namespace.
+    """
+    return signin(user_data, db)
+
 # OAuth2 Token Endpoint (RFC 6749 compliant)
 @app.post("/token", response_model=TokenResponse)
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):

@@ -7,7 +7,12 @@ env_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(env_path)
 
 from langchain_openai import ChatOpenAI,OpenAIEmbeddings
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    CouldNotRetrieveTranscript,
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.schema.runnable import RunnableLambda,RunnableParallel,RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
@@ -22,6 +27,7 @@ from langchain_core.documents import Document
 from pydantic import BaseModel,HttpUrl
 from yt_to_id import get_youtube_video_id
 import os,hashlib
+from pathlib import Path
 #import gradio as gr
 from langdetect import detect
 from langchain.agents import create_react_agent,AgentExecutor
@@ -74,7 +80,7 @@ app.add_middleware(
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY or SECRET_KEY == "change-me":
     raise ValueError(
-        "❌ SECRET_KEY must be set to a strong random value!\n"
+        "[ERROR] SECRET_KEY must be set to a strong random value!\n"
         "   Generate one with: openssl rand -hex 32\n"
         "   Set it in .env file or deployment environment"
     )
@@ -268,22 +274,46 @@ class UserInDB(BaseModel):
 # Validate required API keys at startup
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    print("⚠️  Warning: OPENAI_API_KEY not set! OpenAI features will fail.")
+    print("[WARN] OPENAI_API_KEY not set. OpenAI features will fail.")
     print("   Set OPENAI_API_KEY in .env file to enable AI functionality.")
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 if not PINECONE_API_KEY:
-    print("⚠️  Warning: PINECONE_API_KEY not set! Vector search will fail.")
+    print("[WARN] PINECONE_API_KEY not set. Vector search will fail.")
     print("   Set PINECONE_API_KEY in .env file to enable RAG functionality.")
+
+YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip() or None
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
+YOUTUBE_COOKIES_HEADER = os.getenv("YOUTUBE_COOKIES_HEADER", "").strip() or None
+
+YOUTUBE_PROXIES = None
+if YOUTUBE_PROXY_URL:
+    YOUTUBE_PROXIES = {
+        "http": YOUTUBE_PROXY_URL,
+        "https": YOUTUBE_PROXY_URL,
+    }
+    print(f"[INFO] Using YouTube proxy endpoint: {YOUTUBE_PROXY_URL}")
+
+YOUTUBE_COOKIES = None
+if YOUTUBE_COOKIES_FILE:
+    try:
+        YOUTUBE_COOKIES = Path(YOUTUBE_COOKIES_FILE).read_text(encoding="utf-8").strip()
+        print(f"[INFO] Loaded YouTube cookies from file: {YOUTUBE_COOKIES_FILE}")
+    except Exception as e:
+        print(f"[WARN] Could not read YouTube cookies file '{YOUTUBE_COOKIES_FILE}': {e}")
+
+if not YOUTUBE_COOKIES and YOUTUBE_COOKIES_HEADER:
+    YOUTUBE_COOKIES = YOUTUBE_COOKIES_HEADER
+    print("[INFO] Using YouTube cookies provided via environment header")
 
 model = ChatOpenAI(model="gpt-4o-mini")  # Uses OPENAI_API_KEY from environment
 
 # Load agent prompt once at startup (cache it)
 try:
     REACT_AGENT_PROMPT = hub.pull("hwchase17/react")
-    print("✅ Agent prompt loaded from LangChain hub")
+    print("[OK] Agent prompt loaded from LangChain hub")
 except Exception as e:
-    print(f"⚠️  Warning: Could not load agent prompt from hub: {e}")
+    print(f"[WARN] Could not load agent prompt from hub: {e}")
     print("   Using fallback prompt")
     # Fallback prompt if hub is unavailable
     from langchain.prompts import PromptTemplate
@@ -314,14 +344,14 @@ Thought:{agent_scratchpad}
 if PINECONE_API_KEY:
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
-        print("✅ Pinecone client initialized successfully")
+        print("[OK] Pinecone client initialized successfully")
         print("   Indexes will be created per-user on first request")
     except Exception as e:
-        print(f"⚠️  Warning: Pinecone initialization failed: {e}")
+        print(f"[WARN] Pinecone initialization failed: {e}")
         print("   Pinecone features will not be available.")
         pc = None
 else:
-    print("⚠️  Warning: Pinecone not configured (PINECONE_API_KEY not set)")
+    print("[WARN] Pinecone not configured (PINECONE_API_KEY not set)")
     pc = None
 
 parser = StrOutputParser()
@@ -344,9 +374,13 @@ def fetchTranscript(url:str)->list:
 
     
     try:
-        api = YouTubeTranscriptApi()
-        transcript_list= api.fetch(video_id=video_id,languages=["en","hi"]).to_raw_data()
-        transcript=" ".join(chunk["text"] for chunk in transcript_list) #A string is formed from a list of dictionaries
+        transcript_list = YouTubeTranscriptApi.get_transcript(
+            video_id=video_id,
+            languages=["en", "hi"],
+            proxies=YOUTUBE_PROXIES,
+            cookies=YOUTUBE_COOKIES or None,
+        )
+        transcript = " ".join(chunk["text"] for chunk in transcript_list)  # A string is formed from a list of dictionaries
         if detect(transcript) == "hi":
             prompt_translate = PromptTemplate(
                 template="<task>\nUse your intelligence to translate this Hindi text to english maintaining semantic meaning, correct english spelling and consistency in translation.</task>\n <context> \n {content}</context> ",
@@ -354,11 +388,25 @@ def fetchTranscript(url:str)->list:
             )
             chain_translate = prompt_translate | model | parser
             transcript = chain_translate.invoke({'content':transcript})
-            
     except TranscriptsDisabled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No captions/subtitles available for this video. Please try a video with captions enabled."
+        )
+    except NoTranscriptFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No transcript is available for this video in the requested languages."
+        )
+    except CouldNotRetrieveTranscript as e:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                "YouTube is blocking transcript requests from this server. "
+                "Configure a residential proxy via YOUTUBE_PROXY_URL or provide authenticated cookies "
+                "via YOUTUBE_COOKIES_FILE / YOUTUBE_COOKIES_HEADER environment variables. "
+                f"Original error: {str(e)}"
+            )
         )
     except Exception as e:
         raise HTTPException(
@@ -417,7 +465,7 @@ def get_user_index(username: str):
     existing_indexes = [idx.name for idx in pc.list_indexes()]
     
     if index_name not in existing_indexes:
-        print(f"📝 Creating new Pinecone index for user: {username}")
+        print(f"[INFO] Creating new Pinecone index for user: {username}")
         print(f"   Index name: {index_name}")
         
         # Create new index for this user
@@ -428,10 +476,10 @@ def get_user_index(username: str):
             spec=ServerlessSpec(cloud='aws', region='us-east-1')
         )
         
-        print(f"✅ Index '{index_name}' created successfully")
+        print(f"[OK] Index '{index_name}' created successfully")
         print(f"   Note: First request may take ~60 seconds while index initializes")
     else:
-        print(f"♻️  Using existing Pinecone index: {index_name}")
+        print(f"[INFO] Using existing Pinecone index: {index_name}")
     
     # Return the index handle
     return pc.Index(index_name)
@@ -663,9 +711,9 @@ def answer_from_video(user_input: input, current_user: dict = Depends(require_sc
             ).first()
             
             if session:
-                print(f"♻️  Resuming session {session.session_id}")
+                print(f"[INFO] Resuming session {session.session_id}")
         except Exception as e:
-            print(f"⚠️  Invalid session_id format: {e}")
+            print(f"[WARN] Invalid session_id format: {e}")
             session = None
     
     # If no session found, try to auto-resume user's most recent session
@@ -678,14 +726,14 @@ def answer_from_video(user_input: input, current_user: dict = Depends(require_sc
         ).order_by(UserSession.last_activity.desc()).first()
         
         if session:
-            print(f"🔄 Auto-resumed most recent session {session.session_id}")
+            print(f"[INFO] Auto-resumed most recent session {session.session_id}")
         else:
             # No active sessions - create new one
             session = UserSession(user_id=user.id)
             db.add(session)
             db.commit()
             db.refresh(session)
-            print(f"📝 Created new session {session.session_id} for user {user.username}")
+            print(f"[INFO] Created new session {session.session_id} for user {user.username}")
     
     # ========================================
     # STEP 2: Video Embedding (if URL provided)
@@ -728,9 +776,9 @@ def answer_from_video(user_input: input, current_user: dict = Depends(require_sc
             
             if not already:
                 store.add_documents(documents=chunks, ids=ids)
-                print(f"✅ Embedded video {video_id} for user {user.username}")
+                print(f"[OK] Embedded video {video_id} for user {user.username}")
             else:
-                print(f"♻️  Video {video_id} already embedded")
+                print(f"[INFO] Video {video_id} already embedded")
             
             # Update session with current video
             session.current_video_id = video_id
@@ -910,7 +958,7 @@ def answer_from_video(user_input: input, current_user: dict = Depends(require_sc
     # Commit all changes (trigger will auto-cleanup old messages)
     db.commit()
     
-    print(f"💾 Stored conversation (messages {next_index}-{next_index+1})")
+    print(f"[INFO] Stored conversation (messages {next_index}-{next_index+1})")
     
     # ========================================
     # STEP 7: Return Response

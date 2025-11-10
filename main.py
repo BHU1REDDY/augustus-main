@@ -373,13 +373,16 @@ def fetchTranscript(url:str)->list:
     
 
     
+    api_kwargs = {}
+    if YOUTUBE_PROXIES:
+        api_kwargs["proxies"] = YOUTUBE_PROXIES
+    if YOUTUBE_COOKIES:
+        api_kwargs["cookies"] = YOUTUBE_COOKIES
+
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(
-            video_id=video_id,
-            languages=["en", "hi"],
-            proxies=YOUTUBE_PROXIES,
-            cookies=YOUTUBE_COOKIES or None,
-        )
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id=video_id, **api_kwargs)
+        transcript_obj = transcripts.find_transcript(["en", "en-US", "en-GB", "hi"])
+        transcript_list = transcript_obj.fetch()
         transcript = " ".join(chunk["text"] for chunk in transcript_list)  # A string is formed from a list of dictionaries
         if detect(transcript) == "hi":
             prompt_translate = PromptTemplate(

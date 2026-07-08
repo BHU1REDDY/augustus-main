@@ -1401,9 +1401,9 @@ def batch_upsert_records(index, namespace, records, batch_size=96):
     
     for i in range(0, len(records), batch_size):
         batch = records[i:i + batch_size]
-        # CRITICAL: Method signature is index.upsert_records(namespace, records) - AGENTS.md line 416
+        # Pinecone SDK 9.x: upsert_records takes keyword-only records/namespace
         exponential_backoff_retry(
-            lambda: index.upsert_records(namespace, batch)
+            lambda: index.upsert_records(namespace=namespace, records=batch)
         )
         time.sleep(0.01)  # Rate limiting (reduced from 0.1s for better performance)
 
@@ -1446,7 +1446,7 @@ def upsert_catalog_to_pinecone(
         
         # Upsert to catalog index (user-specific namespace for isolation)
         exponential_backoff_retry(
-            lambda: catalog_index.upsert_records(namespace, [record])
+            lambda: catalog_index.upsert_records(namespace=namespace, records=[record])
         )
         
         print(f"[OK] Synced catalog entry to Pinecone for video {video_id} in namespace {namespace}")
@@ -1617,7 +1617,7 @@ def shortlist_videos_from_catalog(
         video_ids = []
         if results and 'result' in results and 'hits' in results['result']:
             for hit in results['result']['hits']:
-                vid_id = hit.get('fields', {}).get('video_id')
+                vid_id = hit.fields.get('video_id')
                 if vid_id:
                     video_ids.append(vid_id)
         
@@ -1702,12 +1702,12 @@ def retrieve_for_general_tab(
         if results and 'result' in results and 'hits' in results['result']:
             for hit in results['result']['hits']:
                 doc = Document(
-                    page_content=hit['fields']['content'],
+                    page_content=hit.fields['content'],
                     metadata={
-                        'video_id': hit['fields'].get('video_id'),
-                        'doc_id': hit['fields'].get('doc_id'),
-                        '_id': hit['_id'],
-                        '_score': hit['_score']
+                        'video_id': hit.fields.get('video_id'),
+                        'doc_id': hit.fields.get('doc_id'),
+                        '_id': hit.id_,
+                        '_score': hit.score
                     }
                 )
                 raw_docs.append(doc)
@@ -2313,8 +2313,8 @@ def create_youtube_rag_tool_v2(index, namespace: str, video_id: str):
         docs = []
         if results and 'result' in results and 'hits' in results['result']:
             for hit in results['result']['hits']:
-                content = hit.get('fields', {}).get('content', '')
-                score = hit.get('_score', 0.0)
+                content = hit.fields.get('content', '')
+                score = hit.score
                 docs.append(Document(
                     page_content=content,
                     metadata={'_score': score, 'video_id': video_id}

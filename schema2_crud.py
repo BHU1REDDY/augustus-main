@@ -17,7 +17,7 @@ Dependencies: database.py models (VideoConversation, ConversationMessage, Videos
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, and_, func
+from sqlalchemy import desc
 from sqlalchemy.exc import IntegrityError
 import uuid
 import logging
@@ -112,92 +112,6 @@ def get_or_create_conversation(
             return conversation
         # If still fails, re-raise
         raise e
-
-
-def insert_message_with_parent_update(
-    db: Session,
-    conversation_id: uuid.UUID,
-    user_id: uuid.UUID,
-    video_id: str,
-    role: str,
-    content: str,
-    tokens_estimate: Optional[int] = None
-) -> ConversationMessage:
-    """
-    Insert a message and update parent conversation in a single transaction.
-    
-    This is the core write operation for Schema 2. It:
-    1. Computes next message_index (auto-increment per conversation)
-    2. Inserts message into conversation_messages
-    3. Updates parent video_conversations (counters, previews, timestamp)
-    
-    All operations are atomic - if any step fails, the entire transaction rolls back.
-    
-    Args:
-        db: Database session (must be in transaction)
-        conversation_id: Parent conversation UUID
-        user_id: User UUID (denormalized for direct queries)
-        video_id: Video ID (denormalized for direct queries)
-        role: Message role ('user' | 'assistant' | 'system')
-        content: Message content (full text)
-        tokens_estimate: Optional token count estimate
-    
-    Returns:
-        ConversationMessage object (newly created)
-    
-    Raises:
-        ValueError: If role is invalid or conversation not found
-        IntegrityError: If database constraints violated
-    """
-    if role not in ('user', 'assistant', 'system'):
-        raise ValueError(f"Invalid role: {role}")
-    
-    # Get parent conversation (with row lock to prevent race conditions)
-    conversation = db.query(VideoConversation).filter(
-        VideoConversation.conversation_id == conversation_id
-    ).with_for_update().first()
-    
-    if not conversation:
-        raise ValueError(f"Conversation not found: {conversation_id}")
-    
-    # Compute next message_index (0-based)
-    last_msg = db.query(ConversationMessage).filter(
-        ConversationMessage.conversation_id == conversation_id
-    ).order_by(desc(ConversationMessage.message_index)).first()
-    
-    next_index = (last_msg.message_index + 1) if last_msg else 0
-    
-    # Create message
-    message = ConversationMessage(
-        id=uuid_default(),
-        conversation_id=conversation_id,
-        user_id=user_id,
-        video_id=video_id,
-        message_index=next_index,
-        role=role,
-        content=content,
-        content_length=len(content),
-        tokens_estimate=tokens_estimate,
-        created_at=datetime.utcnow()
-    )
-    
-    # Update parent conversation
-    conversation.message_count += 1
-    conversation.last_message_at = datetime.utcnow()
-    
-    # Update preview fields (truncate to 200-300 chars per chatSchema.md)
-    preview_length = 250  # Middle of 200-300 range
-    if role == 'user':
-        conversation.last_user_message = content[:preview_length]
-    elif role == 'assistant':
-        conversation.last_assistant_message = content[:preview_length]
-    
-    # Commit transaction (both message insert and parent update)
-    db.add(message)
-    db.commit()
-    db.refresh(message)
-    
-    return message
 
 
 def insert_conversation_turn(
@@ -347,43 +261,6 @@ def insert_response_evaluation(
 # ============================================================================
 
 
-def get_user_conversations_for_tabs(
-    db: Session,
-    user_id: uuid.UUID,
-    limit: int = 5
-) -> List[VideoConversation]:
-    """
-    Get conversations for tab rendering (pinned + most recent unpinned).
-    
-    Returns conversations ordered by (is_pinned DESC, last_message_at DESC).
-    This uses the composite index created in Phase 0 for optimal performance.
-    
-    Per plans.md: Show pinned + 5 most recent unpinned.
-    
-    Args:
-        db: Database session
-        user_id: User UUID
-        limit: Maximum number of unpinned conversations to return (default: 5)
-    
-    Returns:
-        List of VideoConversation objects with preview data
-    """
-    # Get all pinned conversations
-    pinned = db.query(VideoConversation).filter(
-        VideoConversation.user_id == user_id,
-        VideoConversation.is_pinned == True
-    ).order_by(desc(VideoConversation.last_message_at)).all()
-    
-    # Get most recent unpinned conversations
-    unpinned = db.query(VideoConversation).filter(
-        VideoConversation.user_id == user_id,
-        VideoConversation.is_pinned == False
-    ).order_by(desc(VideoConversation.last_message_at)).limit(limit).all()
-    
-    # Combine: pinned first, then unpinned by recency
-    return pinned + unpinned
-
-
 def get_conversation_by_id(
     db: Session,
     conversation_id: uuid.UUID,
@@ -516,74 +393,6 @@ def get_recent_messages_for_context(
 # ============================================================================
 
 
-def pin_conversation(
-    db: Session,
-    conversation_id: uuid.UUID,
-    user_id: uuid.UUID
-) -> VideoConversation:
-    """
-    Pin a conversation (exempt from retention policy).
-    
-    Args:
-        db: Database session
-        conversation_id: Conversation UUID
-        user_id: User UUID (for authorization)
-    
-    Returns:
-        Updated VideoConversation object
-    
-    Raises:
-        ValueError: If conversation not found or unauthorized
-    """
-    conversation = db.query(VideoConversation).filter(
-        VideoConversation.conversation_id == conversation_id,
-        VideoConversation.user_id == user_id
-    ).first()
-    
-    if not conversation:
-        raise ValueError(f"Conversation not found or unauthorized: {conversation_id}")
-    
-    conversation.is_pinned = True
-    db.commit()
-    db.refresh(conversation)
-    
-    return conversation
-
-
-def unpin_conversation(
-    db: Session,
-    conversation_id: uuid.UUID,
-    user_id: uuid.UUID
-) -> VideoConversation:
-    """
-    Unpin a conversation (subject to retention policy).
-    
-    Args:
-        db: Database session
-        conversation_id: Conversation UUID
-        user_id: User UUID (for authorization)
-    
-    Returns:
-        Updated VideoConversation object
-    
-    Raises:
-        ValueError: If conversation not found or unauthorized
-    """
-    conversation = db.query(VideoConversation).filter(
-        VideoConversation.conversation_id == conversation_id,
-        VideoConversation.user_id == user_id
-    ).first()
-    
-    if not conversation:
-        raise ValueError(f"Conversation not found or unauthorized: {conversation_id}")
-    
-    conversation.is_pinned = False
-    db.commit()
-    db.refresh(conversation)
-    
-    return conversation
-
-
 # ============================================================================
 # VIDEOS CATALOG OPERATIONS
 # ============================================================================
@@ -659,125 +468,9 @@ def get_or_create_catalog_entry(
         raise e
 
 
-def update_catalog_entry(
-    db: Session,
-    video_id: str,
-    synopsis: Optional[str] = None,
-    topics: Optional[List[str]] = None,
-    video_title: Optional[str] = None,
-    embedding_version: Optional[str] = None
-) -> Optional[VideosCatalog]:
-    """
-    Update existing catalog entry (e.g., refresh synopsis/topics).
-    
-    Args:
-        db: Database session
-        video_id: YouTube video ID
-        synopsis: Optional new synopsis
-        topics: Optional new topics list
-        video_title: Optional new title
-        embedding_version: Optional new embedding version
-    
-    Returns:
-        Updated VideosCatalog object or None if not found
-    """
-    catalog = db.query(VideosCatalog).filter(
-        VideosCatalog.video_id == video_id
-    ).first()
-    
-    if not catalog:
-        return None
-    
-    if synopsis is not None:
-        catalog.synopsis = synopsis[:300]
-    if topics is not None:
-        catalog.topics = topics
-    if video_title is not None:
-        catalog.video_title = video_title[:500]
-    if embedding_version is not None:
-        catalog.embedding_version = embedding_version
-        catalog.last_embedded_at = datetime.utcnow()
-    
-    catalog.last_refreshed_at = datetime.utcnow()
-    
-    db.commit()
-    db.refresh(catalog)
-    
-    return catalog
-
-
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
-
-
-def get_conversation_by_user_and_video(
-    db: Session,
-    user_id: uuid.UUID,
-    video_id: str
-) -> Optional[VideoConversation]:
-    """
-    Get conversation by (user_id, video_id) pair.
-    
-    This is useful for checking if a conversation exists before creating.
-    
-    Args:
-        db: Database session
-        user_id: User UUID
-        video_id: YouTube video ID
-    
-    Returns:
-        VideoConversation object or None if not found
-    """
-    return db.query(VideoConversation).filter(
-        VideoConversation.user_id == user_id,
-        VideoConversation.video_id == video_id
-    ).first()
-
-
-def get_message_count(
-    db: Session,
-    conversation_id: uuid.UUID
-) -> int:
-    """
-    Get total message count for a conversation.
-    
-    This can be used to verify the denormalized message_count field.
-    
-    Args:
-        db: Database session
-        conversation_id: Conversation UUID
-    
-    Returns:
-        Integer count of messages
-    """
-    return db.query(func.count(ConversationMessage.id)).filter(
-        ConversationMessage.conversation_id == conversation_id
-    ).scalar()
-
-
-def serialize_conversation_for_api(conversation: VideoConversation) -> Dict[str, Any]:
-    """
-    Serialize VideoConversation object for API response.
-    
-    Args:
-        conversation: VideoConversation object
-    
-    Returns:
-        Dictionary with conversation data for frontend
-    """
-    return {
-        "conversation_id": str(conversation.conversation_id),
-        "video_id": conversation.video_id,
-        "video_url": conversation.video_url,
-        "video_title": conversation.video_title,
-        "created_at": conversation.created_at.isoformat(),
-        "last_message_at": conversation.last_message_at.isoformat(),
-        "message_count": conversation.message_count,
-        "last_user_message": conversation.last_user_message,
-        "last_assistant_message": conversation.last_assistant_message,
-        "is_pinned": conversation.is_pinned
-    }
 
 
 def serialize_message_for_api(message: ConversationMessage) -> Dict[str, Any]:

@@ -1823,20 +1823,6 @@ def health_check(db: Session = Depends(get_db)):
     return health_status
 
 # CORS test endpoint (no authentication required)
-@app.get("/cors-test")
-def cors_test():
-    """Test endpoint to verify CORS configuration"""
-    cors_origins = os.getenv("CORS_ORIGINS", "NOT SET (defaulting to *)")
-    return {
-        "cors_configured": cors_origins != "NOT SET (defaulting to *)",
-        "cors_origins": cors_origins if cors_origins != "NOT SET (defaulting to *)" else "* (all origins allowed)",
-        "message": "If you can see this from your frontend, CORS is working correctly!",
-        "frontend_domains": [
-            "https://www.chataugustus.com",
-            "https://augustus-web-five.vercel.app"
-        ] if cors_origins != "NOT SET (defaulting to *)" else "All origins allowed"
-    }
-
 # User Registration and Authentication Endpoints
 @app.post("/signup", response_model=UserResponse)
 def signup(user_data: UserSignup, db: Session = Depends(get_db)):
@@ -1914,14 +1900,6 @@ def signin(user_data: UserLogin, db: Session = Depends(get_db)):
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
 
-
-@app.post("/api/auth/login", response_model=TokenResponse)
-def api_auth_login(user_data: UserLogin, db: Session = Depends(get_db)):
-    """
-    JSON-based login endpoint used by the frontend bridge.
-    Mirrors the behaviour of /signin but under the /api namespace.
-    """
-    return signin(user_data, db)
 
 # OAuth2 Token Endpoint (RFC 6749 compliant)
 @app.post("/token", response_model=TokenResponse)

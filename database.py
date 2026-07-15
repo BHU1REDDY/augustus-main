@@ -154,10 +154,7 @@ class VideoConversation(Base):
     
     # Retention control
     is_pinned = Column(Boolean, default=False, nullable=False, index=True)
-    
-    # Optional: General tab routing cache
-    synopsis_preview = Column(Text, nullable=True)
-    
+
     # Constraints
     __table_args__ = (
         sa.UniqueConstraint('user_id', 'video_id', name='uq_user_video'),

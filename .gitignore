@@ -26,6 +26,10 @@ venv/
 ENV/
 env/
 .venv
+.venv*/
+
+# DeepEval local cache/telemetry
+.deepeval/
 
 # Environment Variables (NEVER COMMIT!)
 .env

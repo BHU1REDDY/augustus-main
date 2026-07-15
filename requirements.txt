@@ -31,6 +31,9 @@ openai>=1.40.0,<2.0.0
 # --- Vector database client ---
 pinecone>=5.0.0
 
+# --- LLM response evaluation (G-Eval) ---
+deepeval>=1.0.0
+
 # --- Retrieval helpers ---
 youtube-transcript-api>=1.2.3
 langdetect>=1.0.9

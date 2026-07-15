@@ -54,7 +54,7 @@ import requests
 from requests.cookies import RequestsCookieJar
 from http.cookies import SimpleCookie
 
-from fastapi import FastAPI, Path, HTTPException, Query, Depends, status
+from fastapi import FastAPI, Path, HTTPException, Query, Depends, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse
 import secrets
@@ -66,6 +66,7 @@ from database import (
     get_db, User, SessionLocal,
     VideoConversation, ConversationMessage, VideosCatalog  # Schema 2 models
 )
+from evaluation import run_and_store_evaluation
 from schema2_crud import (
     get_or_create_conversation,
     get_conversation_by_id,
@@ -528,7 +529,10 @@ if YOUTUBE_COOKIES:
     cookie_jar = parse_cookie_string(YOUTUBE_COOKIES)
     GLOBAL_HTTP_CLIENT.cookies.update(cookie_jar)
 
-model = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))  # Uses OPENAI_API_KEY from environment
+model = ChatOpenAI(
+    model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.2")),
+)  # Uses OPENAI_API_KEY from environment
 
 # ============================================================================
 # AGENT PROMPT CONSTRUCTION
@@ -563,6 +567,11 @@ CURRENT DATE/TIME CONTEXT:
 - Today's date: {current_date}
 - Current year: {current_year}
 - Use this information to understand what "latest", "recent", "new", "current" means - these refer to information from {current_year}, not past years.
+
+CRITICAL: EVERY NEW QUESTION IS A FRESH TURN:
+- chat_history shows PAST turns for context only. Tool call limits, "already called" status, and any Observations/errors belong ONLY to the CURRENT turn's scratchpad (the Thought/Action/Observation lines below this prompt for THIS question) - they do NOT carry over from chat_history, even if chat_history contains a similar or identical question.
+- Do NOT write "I see an error that this tool was already called" or claim any tool limit was reached unless your OWN scratchpad for THIS turn actually contains an Observation starting with "ERROR: Tool ... already called". If your scratchpad is empty, no such error exists yet - you must call a tool.
+- For every new question, you MUST call at least one tool (youtube_rag_tool_v2, youtube_rag_tool_general, or google_search_tool_v2 as appropriate) before providing a Final Answer - even if chat_history shows you answered a similar question before. Re-verify against the video/web each time; never just paraphrase a prior answer from memory without calling a tool first.
 
 CRITICAL: TOOL SELECTION (READ THIS FIRST):
 - BEFORE choosing any tool, analyze the query for time-sensitive keywords: "latest", "recent", "new", "current", "2024", "2025", "now", "today", "update", "what is new"
@@ -643,13 +652,14 @@ STATE MACHINE (CRITICAL - Parse JSON):
    - Extract: context = "..."  # From the JSON
 
 3. Actions based on status:
-   - If status == "final_answer_required" → STOP immediately, provide Final Answer using context
+   - If status == "final_answer_required" → STOP immediately. Do NOT call any tool again, including a tool you just called - even if you feel like you want more information. Provide Final Answer now using the context you already have.
    - If status == "next_action_required" → Check "next_action" field:
      * CRITICAL: You MUST call the tool specified in "next_action" field (if you haven't called it yet)
      * If next_action == "google_search_tool_v2" and you haven't called it → Call google_search_tool_v2
-     * If next_action == "youtube_rag_tool_general" and you haven't called it → Call youtube_rag_tool_general
-     * If next_action == "youtube_rag_tool_v2" and you haven't called it → Call youtube_rag_tool_v2
-     * If next_action is a tool you already called → Provide Final Answer using the context you have
+     * If next_action == "youtube_rag_tool_general" and you have called it exactly once (with insufficient quality) → Call it again with a refined query (this is the one allowed retry, not a duplicate)
+     * If next_action == "youtube_rag_tool_v2" and you have called it exactly once (with insufficient quality) → Call it again with a refined query (this is the one allowed retry, not a duplicate)
+     * If next_action == "youtube_rag_tool_general" or "youtube_rag_tool_v2" and you haven't called it yet → Call it
+     * If next_action is a tool you already called TWICE, or any other tool you already called ONCE → Provide Final Answer using the context you have
    - If status == "no_results" → Try alternative tool or provide answer
      * Example: If youtube_rag_tool_general returns "no_results", try google_search_tool_v2 for current information
      * If all tools return "no_results", provide Final Answer explaining that no information was found
@@ -684,18 +694,19 @@ TOOL SELECTION REMINDER:
 
 FINAL ANSWER FORMAT:
 - When status is "final_answer_required", your Thought MUST be: "I now know the final answer"
-- Synthesize comprehensively from ALL context in the "context" field
-- Include specific details, examples, and key points
+- If the user's question proposes or asks about a specific claim, choice, or approach (e.g. "should I use X or Y", "is it true that...", "would X work here"), your FIRST sentence MUST directly state whether that claim/approach is correct, incorrect, or partially correct according to the video - answer their actual question head-on before explaining. Do not open with unrelated general background instead of answering.
+- Then synthesize from the "context" field: lead with what the video itself says, include specific details/examples, and avoid introducing outside concepts the video doesn't cover
 - Format: Final Answer: [Your comprehensive answer here]
 - After "Final Answer:", STOP IMMEDIATELY - do not output anything else
 
 LOOP PREVENTION:
 - Before calling ANY tool, check your scratchpad for "Action: [tool_name]"
-- If you see "Action: google_search_tool_v2" already in scratchpad → DO NOT call it again
-- If you see "Action: youtube_rag_tool_general" already in scratchpad → DO NOT call it again  
-- If you see "Action: youtube_rag_tool_v2" already in scratchpad → DO NOT call it again
-- Maximum 1 call per tool per query - this is enforced programmatically
-- If you try to call a tool twice, you will get a plain-text error message → Then provide Final Answer immediately
+- If you see "Action: google_search_tool_v2" already in scratchpad → DO NOT call it again (max 1 call)
+- EXCEPTION - retrieval retry: youtube_rag_tool_general and youtube_rag_tool_v2 may each be called up to TWICE per query, but ONLY if the Observation explicitly says context quality was insufficient AND its "next_action" is the SAME tool you just called. In that specific case only: call it again ONE more time with a rephrased/more specific query targeting what was missing.
+- If a tool's Observation has status "final_answer_required" (even on the FIRST call), you do NOT get a second call - go straight to Final Answer. The 2-call allowance is only for the insufficient-quality retry case above, never a free second call.
+- After a retry (2nd call to the same RAG tool), or if next_action points to a DIFFERENT tool you haven't called yet, follow that next_action instead of retrying again.
+- Maximum 1 call per tool per query for ALL OTHER tools (google_search_tool_v2, etc.) - and maximum 2 calls for youtube_rag_tool_v2 / youtube_rag_tool_general - this is enforced programmatically
+- If you try to exceed these limits, you will get a plain-text error message → Then provide Final Answer immediately
 - CRITICAL: If you see "ERROR: Tool X already called" in Observation → STOP calling tools immediately, provide Final Answer using ALL context from previous Observations
 - When you see an error about a tool already being called, your Thought MUST be: "I see an error that this tool was already called. I should provide Final Answer now using the context I have from previous tool calls."
 """
@@ -834,9 +845,9 @@ FALLBACK_TOP_K = 10                # Base number of results for fallback RAG (al
 MAX_QUERY_LENGTH = 2000            # Maximum characters allowed in user query (prevents context window exhaustion)
 
 # Context Quality Assessment Configuration (for hybrid approach)
-MIN_CONTEXT_QUALITY_AVG_SCORE = 0.3  # Minimum average score for "good" context quality
-MIN_CONTEXT_QUALITY_MAX_SCORE = 0.5  # Minimum max score for "good" context quality
-MIN_CONTEXT_QUALITY_DOC_COUNT = 2    # Minimum number of docs for "good" context quality
+MIN_CONTEXT_QUALITY_AVG_SCORE = 0.45  # Minimum average score for "good" context quality
+MIN_CONTEXT_QUALITY_MAX_SCORE = 0.6   # Minimum max score for "good" context quality
+MIN_CONTEXT_QUALITY_DOC_COUNT = 2     # Minimum number of docs for "good" context quality
 
 parser = StrOutputParser()
 
@@ -2058,9 +2069,9 @@ class AgentState:
         self.last_tool_output: Optional[str] = None
         self.next_action_violations: int = 0  # Track when agent ignores next_action
         self.max_calls_per_tool: Dict[str, int] = {
-            "youtube_rag_tool_v2": 1,
+            "youtube_rag_tool_v2": 2,       # Allow one retry with a refined query on a weak first pass
             "google_search_tool_v2": 1,
-            "youtube_rag_tool_general": 1
+            "youtube_rag_tool_general": 2   # Allow one retry with a refined query on a weak first pass
         }
     
     def can_call_tool(self, tool_name: str) -> bool:
@@ -2271,26 +2282,34 @@ def create_youtube_rag_tool_v2(index, namespace: str, video_id: str):
     Returns:
         LangChain tool for video RAG search
     """
+    call_state = {"count": 0}  # Fresh per request - tracks calls to decide retry vs fallback
+
     @tool
     def youtube_rag_tool_v2(query_text: str) -> str:
         """
         PRIORITY TOOL: Use this FIRST for any question about video content.
-        
+
         Returns relevant context from YouTube videos for the agent to synthesize into an answer.
         This tool searches the specific video associated with this conversation only.
-        
+
         This tool retrieves and returns raw context from the video transcript - the agent will use
         this context to generate the final answer.
-        
+
         Use this when user asks about video content, topics, or specific details from the video.
         Input should be the user's question about the video.
-        
+
+        May be called up to twice: if the first call's context quality is insufficient, you may
+        call it again with a refined/rephrased query targeting what was missing.
+
         Format example:
         Action: youtube_rag_tool_v2
         Action Input: "explain the main topic"
-        
+
         Do NOT use function call syntax like youtube_rag_tool_v2("question").
         """
+        call_state["count"] += 1
+        is_first_call = call_state["count"] <= 1
+
         # Build Pinecone search query with video_id filter
         query_dict = {
             "top_k": 20,
@@ -2355,10 +2374,19 @@ def create_youtube_rag_tool_v2(index, namespace: str, video_id: str):
                 metadata={"video_id": video_id, "is_time_sensitive": True}
             )
         elif not is_quality_sufficient:
-            # Low quality context - recommend web search
+            if is_first_call:
+                # Low quality on first attempt - retry this tool with a refined query before falling back
+                return format_structured_tool_response(
+                    status="next_action_required",
+                    context=f"Context quality insufficient. {quality_reason}\n\nVideo context (may be limited):\n{context}\n\nTry calling youtube_rag_tool_v2 again with a rephrased or more specific query targeting what this context is missing.",
+                    next_action="youtube_rag_tool_v2",
+                    quality_reason=quality_reason,
+                    metadata={"video_id": video_id, "is_time_sensitive": False}
+                )
+            # Already retried and still low quality - fall back to web search
             return format_structured_tool_response(
                 status="next_action_required",
-                context=f"Context quality insufficient. {quality_reason}\n\nVideo context (may be limited):\n{context}",
+                context=f"Context quality still insufficient after retry. {quality_reason}\n\nVideo context (may be limited):\n{context}",
                 next_action="google_search_tool_v2",
                 quality_reason=quality_reason,
                 metadata={"video_id": video_id, "is_time_sensitive": False}
@@ -2367,7 +2395,7 @@ def create_youtube_rag_tool_v2(index, namespace: str, video_id: str):
             # Good quality context - can provide final answer
             return format_structured_tool_response(
                 status="final_answer_required",
-                context=f"Sufficient context from video {video_id}.\n\nIMPORTANT: Your Final Answer should:\n- Synthesize comprehensively (not just summarize)\n- Use ALL relevant context provided\n- Include specific details, examples, and key points\n- Be thorough and detailed for complete understanding\n\nVideo context:\n{context}",
+                context=f"Sufficient context from video {video_id}. STOP - do not call any more tools, including this one again.\n\nIMPORTANT: Your Final Answer must be grounded in the video context below:\n- Lead with what the video itself says - open your answer with the video's own reasoning/explanation, not general textbook framing\n- Every claim must be traceable to something actually present in the Video context\n- Do NOT introduce unrelated algorithms, comparisons, or general CS concepts that are not present in the Video context (e.g. do not bring up Dijkstra's algorithm unless the video itself names it)\n- Prefer concrete details, numbers, examples, or paraphrased quotes over general statements\n- If the video context only partially covers the question, say so explicitly rather than padding with generic filler\n- Do NOT summarize vaguely - be specific\n\nVideo context:\n{context}",
                 quality_reason=quality_reason,
                 metadata={"video_id": video_id, "is_time_sensitive": False}
             )
@@ -2375,15 +2403,49 @@ def create_youtube_rag_tool_v2(index, namespace: str, video_id: str):
     return youtube_rag_tool_v2
 
 
-def create_google_search_tool_v2():
+def create_google_search_tool_v2(agent_state: Any = None):
     """
     Factory function to create google_search_tool_v2 for web search.
-    
+
     Uses GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID environment variables.
-    
+
+    Args:
+        agent_state: Optional AgentState instance. When web search is unavailable/fails
+            permanently, its last_tool_output (typically the RAG tool's response) is used
+            to force a grounded final answer instead of letting the agent fall back to
+            generic, non-video-specific knowledge.
+
     Returns:
         LangChain tool for Google web search
     """
+    def _fallback_to_prior_context(reason: str) -> str:
+        """Force a grounded final answer from the last RAG context when web search is a dead end."""
+        if agent_state and agent_state.last_tool_output:
+            parsed = parse_structured_tool_response(agent_state.last_tool_output)
+            prior_context = parsed.get("context") if parsed else None
+            if prior_context:
+                return format_structured_tool_response(
+                    status="final_answer_required",
+                    context=(
+                        f"{reason}\n\nWeb search is unavailable, so you must answer using the video "
+                        "context already retrieved below - do NOT fall back on generic/textbook knowledge. "
+                        "STOP - do not call any more tools.\n\n"
+                        "IMPORTANT: Your Final Answer must be grounded in this video context:\n"
+                        "- Lead with what the video itself says - open your answer with the video's own reasoning/explanation, not general textbook framing\n"
+                        "- Every claim must be traceable to something actually present in it\n"
+                        "- Do NOT introduce unrelated algorithms, comparisons, or general CS concepts that are not present in this video context\n"
+                        "- Prefer concrete details, examples, or paraphrased quotes over general statements\n"
+                        "- If it only partially answers the question, say so explicitly rather than padding with generic filler\n\n"
+                        f"Video context:\n{prior_context}"
+                    ),
+                    next_action=None
+                )
+        return format_structured_tool_response(
+            status="error",
+            context=f"{reason}\n\nRECOVERY: No prior video context is available either. Explain to the user that the information could not be found.",
+            next_action=None
+        )
+
     @tool
     def google_search_tool_v2(query_text: str) -> str:
         """
@@ -2414,10 +2476,8 @@ def create_google_search_tool_v2():
         search_engine_id = GOOGLE_SEARCH_ENGINE_ID
         
         if not search_api_key or not search_engine_id:
-            return format_structured_tool_response(
-                status="error",
-                context="Web search is not configured (missing GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_ENGINE_ID).\n\nRECOVERY: You cannot use web search. Provide Final Answer using available video context from youtube_rag_tool_v2 or youtube_rag_tool_general, or explain that current web information is unavailable. Do not attempt to call google_search_tool_v2 again.",
-                next_action=None
+            return _fallback_to_prior_context(
+                "Web search is not configured (missing GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_ENGINE_ID)."
             )
         
         url = "https://www.googleapis.com/customsearch/v1"
@@ -2462,7 +2522,7 @@ def create_google_search_tool_v2():
                 # Time-sensitive query: web results are current and sufficient
                 return format_structured_tool_response(
                     status="final_answer_required",
-                    context=f"Web search results received. You have current information from the web.\n\nIMPORTANT: Your Final Answer should:\n- Synthesize comprehensively from web search results\n- Use ALL relevant context provided\n- Include specific details, examples, and key points\n- Be thorough and detailed for complete understanding\n\nWEB_SEARCH_RESULTS:\n{context}",
+                    context=f"Web search results received. You have current information from the web. STOP - do not call any more tools.\n\nIMPORTANT: Your Final Answer should:\n- Synthesize comprehensively from web search results\n- Use ALL relevant context provided\n- Include specific details, examples, and key points\n- Be thorough and detailed for complete understanding\n\nWEB_SEARCH_RESULTS:\n{context}",
                     next_action=None,
                     metadata={"source": "google_search", "result_count": len(docs), "is_time_sensitive": True}
                 )
@@ -2479,17 +2539,13 @@ def create_google_search_tool_v2():
             error_msg = str(e)
             # Determine if error is recoverable
             if "timeout" in error_msg.lower() or "temporarily" in error_msg.lower():
-                recovery = "This appears to be a temporary error. You may try calling google_search_tool_v2 again, or use youtube_rag_tool_general for alternative information."
-                next_action = "youtube_rag_tool_general"
-            else:
-                recovery = "This is a permanent error (e.g., API configuration issue). You should provide Final Answer using available video context from youtube_rag_tool_v2 or youtube_rag_tool_general, or explain that web search is unavailable."
-                next_action = None
-            
-            return format_structured_tool_response(
-                status="error",
-                context=f"Web search failed: {error_msg}\n\nRECOVERY: {recovery}",
-                next_action=next_action
-            )
+                return format_structured_tool_response(
+                    status="error",
+                    context=f"Web search failed: {error_msg}\n\nRECOVERY: This appears to be a temporary error. Use youtube_rag_tool_general for alternative information.",
+                    next_action="youtube_rag_tool_general"
+                )
+            # Permanent error (e.g., API config/auth issue) - fall back to grounded answer from prior video context
+            return _fallback_to_prior_context(f"Web search failed permanently: {error_msg}")
     
     return google_search_tool_v2
 
@@ -2505,10 +2561,15 @@ def create_youtube_rag_tool_general(index, namespace: str):
     Returns:
         LangChain tool for general RAG search with catalog shortlisting
     """
+    call_state = {"count": 0}  # Fresh per request - tracks calls to decide retry vs fallback
+
     @tool
     def youtube_rag_tool_general(query_text: str) -> str:
         """
         Use this tool for questions about video content from your processed YouTube videos.
+
+        May be called up to twice: if the first call's context quality is insufficient, you may
+        call it again with a refined/rephrased query targeting what was missing.
         
         ⚠️ CRITICAL WARNING: DO NOT USE THIS TOOL FIRST FOR TIME-SENSITIVE QUERIES!
         - If the query contains ANY of these words: "latest", "recent", "new", "current", "2024", "2025", "now", "today", "update", "what is new"
@@ -2534,6 +2595,9 @@ def create_youtube_rag_tool_general(index, namespace: str):
         
         Do NOT use function call syntax like youtube_rag_tool_general("question").
         """
+        call_state["count"] += 1
+        is_first_call = call_state["count"] <= 1
+
         # Use General tab retrieval with catalog shortlisting
         docs, shortlisted_video_ids = retrieve_for_general_tab(
             chunks_index=index,
@@ -2577,10 +2641,20 @@ def create_youtube_rag_tool_general(index, namespace: str):
                 metadata={"video_count": len(shortlisted_video_ids), "is_time_sensitive": True}
             )
         elif not is_quality_sufficient:
-            # Low quality context - recommend web search
+            if is_first_call:
+                # Low quality on first attempt - retry this tool with a refined query before falling back
+                return format_structured_tool_response(
+                    status="next_action_required",
+                    context=f"Context quality insufficient. {quality_reason}\n\nVideo context (may be limited):\n{context}{citation_text}\n\nTry calling youtube_rag_tool_general again with a rephrased or more specific query targeting what this context is missing.",
+                    next_action="youtube_rag_tool_general",
+                    quality_reason=quality_reason,
+                    citations=citations,
+                    metadata={"video_count": len(shortlisted_video_ids), "is_time_sensitive": False}
+                )
+            # Already retried and still low quality - fall back to web search
             return format_structured_tool_response(
                 status="next_action_required",
-                context=f"Context quality insufficient. {quality_reason}\n\nVideo context (may be limited):\n{context}{citation_text}",
+                context=f"Context quality still insufficient after retry. {quality_reason}\n\nVideo context (may be limited):\n{context}{citation_text}",
                 next_action="google_search_tool_v2",
                 quality_reason=quality_reason,
                 citations=citations,
@@ -2590,7 +2664,7 @@ def create_youtube_rag_tool_general(index, namespace: str):
             # Good quality context - can provide final answer
             return format_structured_tool_response(
                 status="final_answer_required",
-                context=f"Sufficient context from {len(shortlisted_video_ids)} videos.\n\nIMPORTANT: Your Final Answer should:\n- Synthesize comprehensively (not just summarize)\n- Use ALL relevant context from all videos provided\n- Include specific details, examples, and key points\n- Be thorough and detailed for complete understanding\n\nVideo context:\n{context}{citation_text}",
+                context=f"Sufficient context from {len(shortlisted_video_ids)} videos. STOP - do not call any more tools, including this one again.\n\nIMPORTANT: Your Final Answer must be grounded in the video context below:\n- Lead with what the video itself says - open your answer with the video's own reasoning/explanation, not general textbook framing\n- Every claim must be traceable to something actually present in the Video context\n- Do NOT introduce unrelated algorithms, comparisons, or general CS concepts that are not present in the Video context\n- Prefer concrete details, numbers, examples, or paraphrased quotes over general statements\n- If the video context only partially covers the question, say so explicitly rather than padding with generic filler\n- Do NOT summarize vaguely - be specific\n\nVideo context:\n{context}{citation_text}",
                 quality_reason=quality_reason,
                 citations=citations,
                 metadata={"video_count": len(shortlisted_video_ids), "is_time_sensitive": False}
@@ -2606,6 +2680,7 @@ def create_youtube_rag_tool_general(index, namespace: str):
 @app.post("/api/v2/chat/video", response_model=ConversationResponse)
 async def chat_with_video_v2(
     user_input: ConversationInput,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(require_scope("write")),
     db: Session = Depends(get_db)
 ):
@@ -2766,7 +2841,7 @@ async def chat_with_video_v2(
         
         # STEP 6: Create agent tools using factory functions
         youtube_rag_tool_v2 = create_youtube_rag_tool_v2(index, namespace, video_id)
-        google_search_tool_v2 = create_google_search_tool_v2()
+        google_search_tool_v2 = create_google_search_tool_v2(agent_state=agent_state)
         
         # STEP 7: Wrap tools with ValidatedTool for programmatic validation
         wrapped_youtube_tool = ValidatedTool(
@@ -2799,7 +2874,7 @@ async def chat_with_video_v2(
             def on_tool_start(self, serialized: dict, input_str: str, **kwargs) -> None:
                 """Called when a tool starts execution - check for duplicate calls and next_action violations"""
                 tool_name = serialized.get('name', 'unknown')
-                
+
                 # Check if tool can be called (proactive loop prevention)
                 if not self.agent_state.can_call_tool(tool_name):
                     count = self.agent_state.tool_call_count.get(tool_name, 0)
@@ -2819,7 +2894,7 @@ async def chat_with_video_v2(
                 
                 if isinstance(output, str):
                     self.tool_results.append(output)
-                    
+
                     # NOTE: Don't call agent_state.record_tool_call() here
                     # ValidatedTool already records it. Just parse for monitoring/logging.
                     parsed = parse_structured_tool_response(output)
@@ -2858,11 +2933,11 @@ async def chat_with_video_v2(
                             print(f"[CALLBACK] Final answer detected in LLM output - should stop soon")
         
         tool_tracking_callback = EnhancedToolTrackingCallback(agent_state)
-        
+
         # Create agent executor with enhanced prompt and callbacks
         # Use cached REACT_AGENT_PROMPT which includes tool instructions
         agent = create_react_agent(model, tools, REACT_AGENT_PROMPT)
-        
+
         # Custom parsing error handler that detects final answers
         def custom_parse_error_handler(error: Exception) -> str:
             """Handle parsing errors gracefully, especially after final answers"""
@@ -2874,22 +2949,22 @@ async def chat_with_video_v2(
                 return "FINAL_ANSWER_PROVIDED - STOP EXECUTION NOW"
             # Otherwise, return standard error message
             return f"Invalid format. Remember: After providing 'Final Answer:', you must stop. Error: {error_str}"
-        
+
         agent_executor = AgentExecutor(
-            agent=agent, 
-            tools=tools, 
-            verbose=True, 
+            agent=agent,
+            tools=tools,
+            verbose=True,
             max_iterations=7,  # Increased to allow proper tool chaining and answer synthesis
             handle_parsing_errors=custom_parse_error_handler,
             callbacks=[tool_tracking_callback],  # Add callback for monitoring
             early_stopping_method="generate"  # Stop early if agent generates final answer
         )
-        
+
         # Invoke agent with timeout protection and early stopping monitoring
         # Note: time and asyncio are already imported at module level
         start_time = time.time()
         timeout_seconds = 60.0  # 60 second timeout
-        
+
         try:
             # Run agent with timeout
             # Note: LangChain 0.2.x doesn't support custom should_continue, so we monitor via callback
@@ -2903,38 +2978,38 @@ async def chat_with_video_v2(
                 ),
                 timeout=timeout_seconds
             )
-            
+
             execution_time = time.time() - start_time
             print(f"[TIMING] Agent execution completed in {execution_time:.2f} seconds")
-            
+
             # Check if early stopping was triggered
             if tool_tracking_callback.should_stop:
                 print(f"[STOP] Early stopping was triggered: status={agent_state.current_status}")
-            
+
             # Check for looping behavior (consolidated)
             if len(tool_tracking_callback.tool_calls) > 0:
                 tool_count = {}
                 for tool_name in tool_tracking_callback.tool_calls:
                     tool_count[tool_name] = tool_count.get(tool_name, 0) + 1
-                
+
                 # Check for excessive calls to same tool
                 for tool_name, count in tool_count.items():
                     if count > 1:
                         print(f"[WARNING] Tool {tool_name} called {count} times (should be max 1)")
                         print(f"[WARNING] Tool call sequence: {' -> '.join(tool_tracking_callback.tool_calls)}")
-                
+
                 # Log tool usage summary
                 print(f"[MONITOR] Tools used: {', '.join(set(tool_tracking_callback.tool_calls))}")
                 print(f"[MONITOR] Total tool calls: {len(tool_tracking_callback.tool_calls)}")
-            
+
             # Log next_action violation metrics
             if agent_state.next_action_violations > 0:
                 print(f"[METRICS] next_action violations: {agent_state.next_action_violations}")
             else:
                 print(f"[METRICS] next_action violations: 0 (agent followed all suggestions)")
-            
+
             answer = result.get("output", "I couldn't generate an answer.")
-            
+
             # Extract final answer if it contains the marker (prevent repetition)
             # Also handle structured responses from tools if they appear in the answer
             if "Final Answer:" in answer:
@@ -2949,12 +3024,12 @@ async def chat_with_video_v2(
                             answer = answer.split(separator)[0].strip()
                             break
                     print(f"[INFO] Extracted final answer, removed trailing text")
-            
+
             # Validate answer is not empty after extraction
             if not answer or len(answer.strip()) < 10:
                 print(f"[WARN] Answer too short after extraction, using full output")
                 answer = result.get("output", "I couldn't generate an answer.")
-        
+
         except asyncio.TimeoutError:
             execution_time = time.time() - start_time
             print(f"[ERROR] Agent execution timed out after {execution_time:.2f} seconds")
@@ -2963,7 +3038,7 @@ async def chat_with_video_v2(
                 status_code=504,
                 detail=f"Agent execution timed out after {timeout_seconds} seconds. Please try a simpler query or contact support."
             )
-        
+
         # STEP 7: Store conversation turn in database
         user_msg, assistant_msg = insert_conversation_turn(
             db=db,
@@ -2973,7 +3048,17 @@ async def chat_with_video_v2(
             user_message=user_input.query,
             assistant_message=answer
         )
-        
+
+        # Score the response with G-Eval in the background (never on the request path)
+        background_tasks.add_task(
+            run_and_store_evaluation,
+            assistant_msg.id,
+            conversation.conversation_id,
+            user_input.query,
+            answer,
+            list(tool_tracking_callback.tool_results)
+        )
+
         # STEP 8: Update conversation title if it was generic (after successful message insertion)
         # This is deferred until after successful insert to maintain transaction consistency
         if conversation.video_title == "YouTube Video" and video_title != "YouTube Video":
@@ -2986,7 +3071,7 @@ async def chat_with_video_v2(
                 print(f"[WARN] Failed to update conversation title: {e}")
                 db.rollback()
                 # Continue - title update is non-critical, main transaction already succeeded
-        
+
         # STEP 9: Return response
         return ConversationResponse(
             conversation_id=str(conversation.conversation_id),
@@ -2997,7 +3082,7 @@ async def chat_with_video_v2(
             message_index=assistant_msg.message_index,
             created_at=assistant_msg.created_at.isoformat()
         )
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -3010,6 +3095,7 @@ async def chat_with_video_v2(
 @app.post("/api/v2/chat/general")
 async def chat_general_tab(
     user_input: ConversationInput,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(require_scope("write")),
     db: Session = Depends(get_db)
 ):
@@ -3135,7 +3221,7 @@ async def chat_general_tab(
         # STEP 6: Create General tab tools using factory functions
         # Create tools - IMPORTANT: Order matters for time-sensitive queries
         # google_search_tool_v2 should be first to prioritize web search for "recent" queries
-        google_search_tool_v2 = create_google_search_tool_v2()
+        google_search_tool_v2 = create_google_search_tool_v2(agent_state=agent_state)
         youtube_rag_tool_general = create_youtube_rag_tool_general(index, namespace)
         
         # STEP 7: Wrap tools with ValidatedTool for programmatic validation
@@ -3187,7 +3273,7 @@ async def chat_general_tab(
                 
                 if isinstance(output, str):
                     self.tool_results.append(output)
-                    
+
                     # NOTE: Don't call agent_state.record_tool_call() here
                     # ValidatedTool already records it. Just parse for monitoring/logging.
                     parsed = parse_structured_tool_response(output)
@@ -3225,7 +3311,7 @@ async def chat_general_tab(
                             print(f"[CALLBACK] Final answer detected in LLM output - should stop soon")
         
         tool_tracking_callback = EnhancedToolTrackingCallback(agent_state)
-        
+
         # Custom parsing error handler (same as video endpoint)
         def custom_parse_error_handler(error: Exception) -> str:
             """Handle parsing errors gracefully, especially after final answers"""
@@ -3235,7 +3321,7 @@ async def chat_general_tab(
                 agent_state.final_answer_provided = True
                 return "FINAL_ANSWER_PROVIDED - STOP EXECUTION NOW"
             return f"Invalid format. Remember: After providing 'Final Answer:', you must stop. Error: {error_str}"
-        
+
         # Create agent executor
         agent = create_react_agent(model, tools, REACT_AGENT_PROMPT)
         agent_executor = AgentExecutor(
@@ -3247,12 +3333,12 @@ async def chat_general_tab(
             callbacks=[tool_tracking_callback],
             early_stopping_method="generate"  # Stop early if agent generates final answer
         )
-        
+
         # Run agent with timeout
         # Note: time and asyncio are already imported at module level
         start_time = time.time()
         timeout_seconds = 60.0
-        
+
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -3264,38 +3350,38 @@ async def chat_general_tab(
                 ),
                 timeout=timeout_seconds
             )
-            
+
             execution_time = time.time() - start_time
             print(f"[TIMING] General tab execution completed in {execution_time:.2f} seconds")
-            
+
             # Check if early stopping was triggered
             if tool_tracking_callback.should_stop:
                 print(f"[STOP] Early stopping was triggered: status={agent_state.current_status}")
-            
+
             # Check for looping behavior (consolidated)
             if len(tool_tracking_callback.tool_calls) > 0:
                 tool_count = {}
                 for tool_name in tool_tracking_callback.tool_calls:
                     tool_count[tool_name] = tool_count.get(tool_name, 0) + 1
-                
+
                 # Check for excessive calls to same tool
                 for tool_name, count in tool_count.items():
                     if count > 1:
                         print(f"[WARNING] Tool {tool_name} called {count} times (should be max 1)")
                         print(f"[WARNING] Tool call sequence: {' -> '.join(tool_tracking_callback.tool_calls)}")
-                
+
                 # Log tool usage summary
                 print(f"[MONITOR] Tools used: {', '.join(set(tool_tracking_callback.tool_calls))}")
                 print(f"[MONITOR] Total tool calls: {len(tool_tracking_callback.tool_calls)}")
-            
+
             # Log next_action violation metrics
             if agent_state.next_action_violations > 0:
                 print(f"[METRICS] next_action violations: {agent_state.next_action_violations}")
             else:
                 print(f"[METRICS] next_action violations: 0 (agent followed all suggestions)")
-            
+
             answer = result.get("output", "I couldn't generate an answer.")
-            
+
             # Extract final answer if it contains the marker (prevent repetition)
             # Also handle structured responses from tools if they appear in the answer
             if "Final Answer:" in answer:
@@ -3309,12 +3395,12 @@ async def chat_general_tab(
                             answer = answer.split(separator)[0].strip()
                             break
                     print(f"[INFO] Extracted final answer, removed trailing text")
-            
+
             # Validate answer is not empty after extraction
             if not answer or len(answer.strip()) < 10:
                 print(f"[WARN] Answer too short after extraction, using full output")
                 answer = result.get("output", "I couldn't generate an answer.")
-        
+
         except asyncio.TimeoutError:
             execution_time = time.time() - start_time
             print(f"[ERROR] General tab execution timed out after {execution_time:.2f} seconds")
@@ -3323,7 +3409,7 @@ async def chat_general_tab(
                 status_code=504,
                 detail=f"Request timed out after {timeout_seconds} seconds"
             )
-        
+
         # STEP 7: Store conversation turn
         user_msg, assistant_msg = insert_conversation_turn(
             db=db,
@@ -3333,7 +3419,17 @@ async def chat_general_tab(
             user_message=user_input.query,
             assistant_message=answer
         )
-        
+
+        # Score the response with G-Eval in the background (never on the request path)
+        background_tasks.add_task(
+            run_and_store_evaluation,
+            assistant_msg.id,
+            conversation.conversation_id,
+            user_input.query,
+            answer,
+            list(tool_tracking_callback.tool_results)
+        )
+
         # STEP 8: Return response
         return ConversationResponse(
             conversation_id=str(conversation.conversation_id),
@@ -3344,7 +3440,7 @@ async def chat_general_tab(
             message_index=assistant_msg.message_index,
             created_at=assistant_msg.created_at.isoformat()
         )
-    
+
     except HTTPException:
         raise
     except Exception as e:

@@ -35,6 +35,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Text,
+    Float,
     ForeignKey,
     CheckConstraint,
     Index,
@@ -210,6 +211,39 @@ class ConversationMessage(Base):
     
     def __repr__(self):
         return f"<ConversationMessage(id='{self.id}', conversation_id='{self.conversation_id}', role='{self.role}', index={self.message_index})>"
+
+
+class ResponseEvaluation(Base):
+    """
+    G-Eval scoring results for an assistant response.
+    One row per evaluated assistant message.
+    """
+    __tablename__ = "response_evaluations"
+
+    # Primary key
+    id = Column(UUID_TYPE, primary_key=True, default=uuid_default)
+
+    # Foreign key to the scored assistant message
+    message_id = Column(
+        UUID_TYPE,
+        ForeignKey('conversation_messages.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True
+    )
+    conversation_id = Column(UUID_TYPE, nullable=False, index=True)
+
+    # G-Eval scores (0-1) and reasoning; nullable since a metric can fail independently
+    relevancy_score = Column(Float, nullable=True)
+    relevancy_reason = Column(Text, nullable=True)
+    faithfulness_score = Column(Float, nullable=True)
+    faithfulness_reason = Column(Text, nullable=True)
+    coherence_score = Column(Float, nullable=True)
+    coherence_reason = Column(Text, nullable=True)
+
+    evaluated_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<ResponseEvaluation(message_id='{self.message_id}', relevancy={self.relevancy_score}, faithfulness={self.faithfulness_score}, coherence={self.coherence_score})>"
 
 
 class VideosCatalog(Base):

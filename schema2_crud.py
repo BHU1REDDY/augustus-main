@@ -29,6 +29,7 @@ from database import (
     VideoConversation,
     ConversationMessage,
     VideosCatalog,
+    ResponseEvaluation,
     UUID_TYPE,
     uuid_default,
 )
@@ -300,6 +301,45 @@ def insert_conversation_turn(
     except Exception as e:
         db.rollback()  # Now this actually works - rolls back entire turn
         raise e
+
+
+def insert_response_evaluation(
+    db: Session,
+    message_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    results: Dict[str, Dict[str, Any]]
+) -> "ResponseEvaluation":
+    """
+    Persist G-Eval scoring results for an assistant message.
+
+    Args:
+        db: Database session
+        message_id: The assistant ConversationMessage.id being scored
+        conversation_id: Parent conversation UUID
+        results: Dict keyed by metric name ("relevancy", "faithfulness", "coherence"),
+                 each value a dict with optional "score" (float) and "reason" (str).
+                 A metric missing from results (or with score=None) is stored as NULL,
+                 since metrics can fail independently.
+
+    Returns:
+        The created ResponseEvaluation row.
+    """
+    evaluation = ResponseEvaluation(
+        id=uuid_default(),
+        message_id=message_id,
+        conversation_id=conversation_id,
+        relevancy_score=results.get("relevancy", {}).get("score"),
+        relevancy_reason=results.get("relevancy", {}).get("reason"),
+        faithfulness_score=results.get("faithfulness", {}).get("score"),
+        faithfulness_reason=results.get("faithfulness", {}).get("reason"),
+        coherence_score=results.get("coherence", {}).get("score"),
+        coherence_reason=results.get("coherence", {}).get("reason"),
+        evaluated_at=datetime.utcnow()
+    )
+    db.add(evaluation)
+    db.commit()
+    db.refresh(evaluation)
+    return evaluation
 
 
 # ============================================================================

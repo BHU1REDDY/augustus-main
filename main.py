@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dotenv import load_dotenv
 import os
 
@@ -10,7 +12,7 @@ load_dotenv(env_path)
 if not os.getenv("LANGCHAIN_API_KEY"):
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
-from langchain_openai import ChatOpenAI,OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -19,7 +21,6 @@ from youtube_transcript_api import (
 )
 from youtube_transcript_api.proxies import GenericProxyConfig
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.runnables import RunnableLambda,RunnableParallel,RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from pinecone import Pinecone
 from langchain_core.prompts import PromptTemplate
@@ -28,7 +29,6 @@ from pydantic import BaseModel,HttpUrl
 from yt_to_id import get_youtube_video_id
 import hashlib
 from pathlib import Path
-#import gradio as gr
 from langdetect import detect
 from langchainhub import Client as HubClient
 # LangChain 0.2.x agent imports
@@ -54,17 +54,14 @@ import requests
 from requests.cookies import RequestsCookieJar
 from http.cookies import SimpleCookie
 
-from fastapi import FastAPI, Path, HTTPException, Query, Depends, status, BackgroundTasks
+from fastapi import FastAPI, Path as FastAPIPath, HTTPException, Depends, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import JSONResponse
-import secrets
-import base64
 from typing import Optional, Dict, Any, Tuple, List, Callable, Set
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from database import (
     get_db, User, SessionLocal,
-    VideoConversation, ConversationMessage, VideosCatalog  # Schema 2 models
+    VideoConversation, VideosCatalog  # Schema 2 models
 )
 from evaluation import run_and_store_evaluation
 from schema2_crud import (
@@ -76,7 +73,6 @@ from schema2_crud import (
     get_conversation_messages,
     serialize_message_for_api,
     verify_conversation_ownership,
-    get_user_conversation_ids,
 )
 from langchain_core.messages import HumanMessage, AIMessage
 try:
@@ -345,18 +341,6 @@ def require_scope(required_scope: str):
         return current_user
     return scope_checker
 
-# Legacy Basic Authentication (for backward compatibility)
-def get_current_user_basic(username: str = Depends(oauth2_scheme)):
-    """Legacy basic authentication - kept for backward compatibility"""
-    # This is a placeholder - in practice, you'd implement basic auth here
-    # For now, we'll redirect to OAuth2
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Please use OAuth2 authentication. Use /token endpoint to get access token.",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-
 
 # User Authentication Models
 class UserSignup(BaseModel):
@@ -377,10 +361,6 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str
     expires_in: int
-
-class TokenData(BaseModel):
-    username: Optional[str] = None
-    scopes: list[str] = []
 
 # ============================================================================
 # SCHEMA 2 PYDANTIC MODELS
@@ -460,20 +440,6 @@ if not GOOGLE_SEARCH_ENGINE_ID:
 
 # Time-sensitive keywords for tool selection logic
 TIME_SENSITIVE_KEYWORDS = ["latest", "recent", "new", "current", "2024", "2025", "now", "today", "update", "what is new"]
-
-def is_time_sensitive_query(query: str) -> bool:
-    """
-    Check if a query is time-sensitive based on keywords.
-    
-    Args:
-        query: The user query string
-        
-    Returns:
-        True if query contains time-sensitive keywords, False otherwise
-    """
-    query_lower = query.lower()
-    return any(keyword in query_lower for keyword in TIME_SENSITIVE_KEYWORDS)
-
 
 YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip() or None
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
@@ -866,6 +832,7 @@ parser = StrOutputParser()
 #Fetching video transcript
 def fetchTranscript(url:str)->list:
     video_id=get_youtube_video_id(url)
+    snippets = None  # Per-snippet (text, start_time) timing, when it can be trusted (see below)
 
     try:
         # Reuse global client if available, otherwise create new one
@@ -895,6 +862,11 @@ def fetchTranscript(url:str)->list:
             )
             chain_translate = prompt_translate | model | parser
             transcript = chain_translate.invoke({'content':transcript})
+            # Translation rewrites the whole transcript as one LLM pass, so the original
+            # per-snippet boundaries no longer line up with the translated text - leave
+            # snippets as None rather than attach timestamps to the wrong text.
+        else:
+            snippets = list(transcript_list)
     except TranscriptsDisabled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -921,7 +893,7 @@ def fetchTranscript(url:str)->list:
             detail=f"Failed to fetch video transcript: {str(e)}"
         )
 
-    l = [transcript, video_id]
+    l = [transcript, video_id, snippets]
     return l
 
 
@@ -1023,7 +995,6 @@ def assess_context_quality(docs: List[Document]) -> Tuple[bool, str]:
     doc_count = len(docs)
     avg_score = sum(scores) / len(scores)
     max_score = max(scores)
-    min_score = min(scores)
     
     # Quality assessment criteria
     has_sufficient_docs = doc_count >= MIN_CONTEXT_QUALITY_DOC_COUNT
@@ -1055,9 +1026,16 @@ def format_docs(retrieved_docs, max_length=None):
     """
     if not retrieved_docs:
         return ""
-    
-    context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
-    
+
+    parts = []
+    for doc in retrieved_docs:
+        start_time = doc.metadata.get('start_time')
+        if start_time is not None:
+            parts.append(f"[{format_timestamp(start_time)}] {doc.page_content}")
+        else:
+            parts.append(doc.page_content)
+    context_text = "\n\n".join(parts)
+
     # Defensive check: truncate if somehow exceeds limit
     if max_length and len(context_text) > max_length:
         print(f"[WARN] Context exceeded limit ({len(context_text)} > {max_length}), truncating")
@@ -1120,6 +1098,101 @@ def format_citations_from_docs(docs: List[Document], db_session_or_factory: Call
         # Only close session if we created it (via factory)
         if should_close:
             db.close()
+
+
+def contextualize_query(query: str, history: List[Any]) -> str:
+    """
+    Rewrite a possibly-ambiguous follow-up into a standalone question before it's
+    used for retrieval, e.g. "what about the second part?" -> "What does the video
+    say about the second part of neural networks?". Without this, embedding search
+    runs on the raw follow-up text, which often lacks the topic entirely and so
+    retrieves the wrong chunks no matter how good the reranker is - the agent's own
+    in-context chat_history instructions help with reasoning, but don't reliably fix
+    what actually gets embedded and searched.
+
+    No-op (returns query unchanged) when there's no history yet, to avoid a wasted
+    LLM call on the first turn of a conversation.
+    """
+    if not history:
+        return query
+
+    history_text = "\n".join(
+        f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}"
+        for m in history[-6:]  # last ~3 turns is enough context to disambiguate
+    )
+
+    prompt = (
+        "Given the conversation history and a follow-up question, rewrite the follow-up "
+        "into a standalone question that contains all the context needed to understand it "
+        "on its own, without needing the history. Do NOT answer the question - only rewrite it. "
+        "If the follow-up question is already standalone (doesn't reference prior context), "
+        "return it unchanged. Return ONLY the rewritten question, nothing else.\n\n"
+        f"Conversation history:\n{history_text}\n\n"
+        f"Follow-up question: {query}\n\n"
+        "Standalone question:"
+    )
+
+    try:
+        response = model.invoke(prompt)
+        rewritten = response.content if hasattr(response, 'content') else str(response)
+        rewritten = rewritten.strip().strip('"')
+        return rewritten if rewritten else query
+    except Exception as e:
+        print(f"[WARN] Query contextualization failed: {e}, using original query")
+        return query
+
+
+def format_timestamp(seconds: Any) -> str:
+    """Format a video offset in seconds as M:SS or H:MM:SS for display in context/answers."""
+    try:
+        total_seconds = int(float(seconds))
+    except (TypeError, ValueError):
+        return ""
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def chunk_transcript_with_timestamps(
+    snippets: List[Any],
+    chunk_size: int = 1200,
+    chunk_overlap: int = 400
+) -> List[Tuple[str, float]]:
+    """
+    Chunk transcript snippets (objects with .text/.start, as returned by
+    youtube-transcript-api) into ~chunk_size character pieces, walking snippet
+    boundaries instead of raw character offsets. This mirrors the size/overlap
+    semantics of RecursiveCharacterTextSplitter closely enough for retrieval
+    chunking, but - unlike splitting a single joined string - keeps track of the
+    video timestamp each chunk actually starts at, so retrieved context can be
+    grounded to a moment in the video instead of being an anonymous text blob.
+
+    Returns a list of (chunk_text, start_seconds) tuples.
+    """
+    chunks: List[Tuple[str, float]] = []
+    n = len(snippets)
+    i = 0
+    while i < n:
+        start_idx = i
+        texts = []
+        length = 0
+        while i < n and length < chunk_size:
+            texts.append(snippets[i].text)
+            length += len(snippets[i].text) + 1
+            i += 1
+        chunks.append((" ".join(texts), snippets[start_idx].start))
+        if i >= n:
+            break
+        # Step back far enough to build the configured overlap for the next chunk
+        overlap_len = 0
+        j = i - 1
+        while j > start_idx and overlap_len < chunk_overlap:
+            overlap_len += len(snippets[j].text) + 1
+            j -= 1
+        i = j + 1
+    return chunks
 
 
 def process_retrieval_results(docs, min_score=None, max_per_video=None, max_context_length=None):
@@ -1512,27 +1585,37 @@ def embed_video_if_needed(
     # Fetch transcript
     l = fetchTranscript(video_url)
     transcript = l[0]
-    
+    snippets = l[2] if len(l) > 2 else None
+
     # Generate synopsis and topics for catalog
     print(f"[INFO] Generating synopsis for video {video_id}")
     video_title = "YouTube Video"  # Default fallback
     synopsis, topics = generate_video_synopsis(transcript, video_title)
     print(f"[OK] Generated synopsis ({len(synopsis)} chars) and {len(topics)} topics")
-    
+
     # Embed in Pinecone
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=400)
-    chunks = parent_splitter.create_documents([transcript])
-    
+    # When snippet timing survived (not translated - see fetchTranscript), chunk along
+    # snippet boundaries so each chunk keeps a timestamp. Otherwise fall back to plain
+    # character-based splitting with no timestamps.
+    if snippets:
+        chunk_pairs = chunk_transcript_with_timestamps(snippets, chunk_size=1200, chunk_overlap=400)
+    else:
+        parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=400)
+        chunk_pairs = [(doc.page_content, None) for doc in parent_splitter.create_documents([transcript])]
+
     # Prepare records (text only - Pinecone embeds automatically)
     records = []
-    for i, chunk in enumerate(chunks):
-        vector_id = f"{video_id}:{hashlib.sha1(chunk.page_content.encode('utf-8')).hexdigest()[:16]}"
-        records.append({
+    for i, (chunk_text, start_time) in enumerate(chunk_pairs):
+        vector_id = f"{video_id}:{hashlib.sha1(chunk_text.encode('utf-8')).hexdigest()[:16]}"
+        record = {
             "_id": vector_id,
-            "content": chunk.page_content,
+            "content": chunk_text,
             "video_id": video_id,
             "doc_id": f"{video_id}:p{i}"
-        })
+        }
+        if start_time is not None:
+            record["start_time"] = float(start_time)
+        records.append(record)
     
     # Defensive check: verify records don't already exist
     already = False
@@ -1718,7 +1801,8 @@ def retrieve_for_general_tab(
                         'video_id': hit.fields.get('video_id'),
                         'doc_id': hit.fields.get('doc_id'),
                         '_id': hit.id_,
-                        '_score': hit.score
+                        '_score': hit.score if isinstance(hit.score, (int, float)) else 0.0,
+                        'start_time': hit.fields.get('start_time')
                     }
                 )
                 raw_docs.append(doc)
@@ -1736,49 +1820,6 @@ def retrieve_for_general_tab(
     except Exception as e:
         print(f"[ERROR] General tab retrieval failed: {e}")
         return [], shortlisted_video_ids
-
-
-# ============================================================================
-# DATABASE INTEGRITY UTILITIES (Phase 4)
-# ============================================================================
-
-def check_conversation_ownership_integrity(db: Session, conversation_id) -> Dict[str, Any]:
-    """
-    Check if conversation has valid user_id reference.
-    
-    Phase 4.10: Utility function to check for orphaned conversations.
-    Used for diagnostic purposes to identify database integrity issues.
-    
-    Args:
-        db: Database session
-        conversation_id: Conversation UUID to check (can be str or UUID)
-    
-    Returns:
-        Dictionary with integrity check results:
-        - "exists": bool - Whether conversation exists
-        - "conversation_user_id": str - User ID that owns the conversation
-        - "user_exists": bool - Whether the user still exists in database
-        - "user_username": Optional[str] - Username if user exists
-    """
-    import uuid as uuid_lib
-    # Convert to UUID if string
-    if isinstance(conversation_id, str):
-        conversation_id = uuid_lib.UUID(conversation_id)
-    
-    conversation = db.query(VideoConversation).filter(
-        VideoConversation.conversation_id == conversation_id
-    ).first()
-    
-    if not conversation:
-        return {"exists": False}
-    
-    user = db.query(User).filter(User.id == conversation.user_id).first()
-    return {
-        "exists": True,
-        "conversation_user_id": str(conversation.user_id),
-        "user_exists": user is not None,
-        "user_username": user.username if user else None
-    }
 
 
 # Health check endpoint (no authentication required)
@@ -2174,6 +2215,64 @@ def parse_structured_tool_response(output: str) -> dict:
     return result
 
 
+def build_fallback_answer_from_tool_limit(agent_state: "AgentState", query: str) -> str:
+    """
+    Synthesize a real answer when ToolCallLimitExceeded cuts the agent loop short,
+    instead of surfacing raw tool context or the generic "Agent stopped due to
+    iteration limit" message. Makes one direct LLM call (bypassing the stuck agent
+    loop) using whatever context was retrieved, if any; otherwise falls back to the
+    LLM's own general knowledge, clearly caveated as not grounded in the video or
+    live web data.
+    """
+    context = None
+    if agent_state.last_tool_output:
+        parsed = parse_structured_tool_response(agent_state.last_tool_output)
+        context = parsed.get("context") if parsed else None
+
+    if context:
+        prompt = (
+            "Answer the user's question using the context below where it's relevant. "
+            "If the context itself says web search failed and tells you to use your own "
+            "general knowledge instead, do that - ignore the failure/instruction text and "
+            "just answer the actual question directly from what you know, telling the user "
+            "this particular answer isn't based on the video or live web data.\n\n"
+            f"Question: {query}\n\nContext:\n{context}"
+        )
+    else:
+        prompt = (
+            f"Answer this question using your own general knowledge: {query}\n\n"
+            "Clearly tell the user this answer is not based on the video or live web data, "
+            "so they know to double-check anything time-sensitive."
+        )
+
+    try:
+        response = model.invoke(prompt)
+        return response.content if hasattr(response, 'content') else str(response)
+    except Exception as e:
+        print(f"[WARN] Fallback LLM synthesis failed: {e}")
+        return context or (
+            "I wasn't able to find a complete answer to this question. "
+            "Please try rephrasing it or asking something more specific."
+        )
+
+
+class ToolCallLimitExceeded(Exception):
+    """
+    Raised by ValidatedTool when a tool is invoked past its call limit.
+
+    Mechanically halts the agent loop by propagating out of AgentExecutor.invoke()
+    (BaseTool.run() re-raises any exception that isn't a ToolException) instead of
+    relying on the LLM to read and obey an in-context "stop calling tools" message,
+    which it does not reliably do (observed: the agent kept retrying a failing
+    google_search_tool_v2 call across all 7 iterations, ignoring that instruction
+    every time, and burning the whole budget on the generic "stopped due to
+    iteration limit" fallback instead of a real answer).
+    """
+    def __init__(self, tool_name: str):
+        self.tool_name = tool_name
+        super().__init__(f"Tool {tool_name} already called past its limit")
+
+
 class ValidatedTool(BaseTool):
     """Tool wrapper that validates state before execution"""
     # Required by BaseTool - these ARE Pydantic fields
@@ -2201,17 +2300,8 @@ class ValidatedTool(BaseTool):
     def _run(self, *args, **kwargs) -> str:
         """Execute tool with validation"""
         if not self.agent_state.can_call_tool(self.tool_name):
-            # Return PLAIN TEXT error, not JSON, to force Final Answer
-            # Make it very explicit what the agent should do
-            return (
-                f"ERROR: Tool {self.tool_name} already called. "
-                "STOP calling tools immediately. "
-                "You have already called this tool and received results. "
-                "Check your scratchpad - look at previous Observations. "
-                "You MUST provide Final Answer now using ALL context from previous tool Observations. "
-                "Do NOT call any more tools. Write 'Thought: I see an error that this tool was already called. I should provide Final Answer now using the context I have from previous tool calls.' "
-                "Then write 'Final Answer: [your answer here]'"
-            )
+            # Mechanically stop the agent loop instead of asking the LLM to stop itself.
+            raise ToolCallLimitExceeded(self.tool_name)
         # Execute original tool
         result = self.original_tool.invoke(*args, **kwargs)
         # Record call in agent state (this parses next_action from result)
@@ -2311,10 +2401,10 @@ def create_youtube_rag_tool_v2(index, namespace: str, video_id: str):
         if results and 'result' in results and 'hits' in results['result']:
             for hit in results['result']['hits']:
                 content = hit.fields.get('content', '')
-                score = hit.score
+                score = hit.score if isinstance(hit.score, (int, float)) else 0.0
                 docs.append(Document(
                     page_content=content,
-                    metadata={'_score': score, 'video_id': video_id}
+                    metadata={'_score': score, 'video_id': video_id, 'start_time': hit.fields.get('start_time')}
                 ))
         
         # Post-process (diversity, context length)
@@ -2373,7 +2463,7 @@ def create_youtube_rag_tool_v2(index, namespace: str, video_id: str):
             # Good quality context - can provide final answer
             return format_structured_tool_response(
                 status="final_answer_required",
-                context=f"Sufficient context from video {video_id}. STOP - do not call any more tools, including this one again.\n\nIMPORTANT: Your Final Answer must be grounded in the video context below:\n- Lead with what the video itself says - open your answer with the video's own reasoning/explanation, not general textbook framing\n- Every claim must be traceable to something actually present in the Video context\n- Do NOT introduce unrelated algorithms, comparisons, or general CS concepts that are not present in the Video context (e.g. do not bring up Dijkstra's algorithm unless the video itself names it)\n- Prefer concrete details, numbers, examples, or paraphrased quotes over general statements\n- If the video context only partially covers the question, say so explicitly rather than padding with generic filler\n- Do NOT summarize vaguely - be specific\n\nVideo context:\n{context}",
+                context=f"Sufficient context from video {video_id}. STOP - do not call any more tools, including this one again.\n\nIMPORTANT: Your Final Answer must be grounded in the video context below:\n- Lead with what the video itself says - open your answer with the video's own reasoning/explanation, not general textbook framing\n- Every claim must be traceable to something actually present in the Video context\n- Do NOT introduce unrelated algorithms, comparisons, or general CS concepts that are not present in the Video context (e.g. do not bring up Dijkstra's algorithm unless the video itself names it)\n- Prefer concrete details, numbers, examples, or paraphrased quotes over general statements\n- If the video context only partially covers the question, say so explicitly rather than padding with generic filler\n- Do NOT summarize vaguely - be specific\n- If a passage below starts with a timestamp marker like [2:15], you may reference it in your answer (e.g. \"around 2:15, the video explains...\") so the user knows where to look\n\nVideo context:\n{context}",
                 quality_reason=quality_reason,
                 metadata={"video_id": video_id, "is_time_sensitive": False}
             )
@@ -2419,8 +2509,14 @@ def create_google_search_tool_v2(agent_state: Any = None):
                     next_action=None
                 )
         return format_structured_tool_response(
-            status="error",
-            context=f"{reason}\n\nRECOVERY: No prior video context is available either. Explain to the user that the information could not be found.",
+            status="final_answer_required",
+            context=(
+                f"{reason}\n\nWeb search is unavailable and there is no prior video context to fall back on. "
+                "STOP - do not call any more tools, including this one again.\n\n"
+                "Answer the question using your own general knowledge as an LLM instead. "
+                "Clearly tell the user that this answer is not based on the video or live web data, "
+                "so they know to double-check anything time-sensitive."
+            ),
             next_action=None
         )
 
@@ -2642,7 +2738,7 @@ def create_youtube_rag_tool_general(index, namespace: str):
             # Good quality context - can provide final answer
             return format_structured_tool_response(
                 status="final_answer_required",
-                context=f"Sufficient context from {len(shortlisted_video_ids)} videos. STOP - do not call any more tools, including this one again.\n\nIMPORTANT: Your Final Answer must be grounded in the video context below:\n- Lead with what the video itself says - open your answer with the video's own reasoning/explanation, not general textbook framing\n- Every claim must be traceable to something actually present in the Video context\n- Do NOT introduce unrelated algorithms, comparisons, or general CS concepts that are not present in the Video context\n- Prefer concrete details, numbers, examples, or paraphrased quotes over general statements\n- If the video context only partially covers the question, say so explicitly rather than padding with generic filler\n- Do NOT summarize vaguely - be specific\n\nVideo context:\n{context}{citation_text}",
+                context=f"Sufficient context from {len(shortlisted_video_ids)} videos. STOP - do not call any more tools, including this one again.\n\nIMPORTANT: Your Final Answer must be grounded in the video context below:\n- Lead with what the video itself says - open your answer with the video's own reasoning/explanation, not general textbook framing\n- Every claim must be traceable to something actually present in the Video context\n- Do NOT introduce unrelated algorithms, comparisons, or general CS concepts that are not present in the Video context\n- Prefer concrete details, numbers, examples, or paraphrased quotes over general statements\n- If the video context only partially covers the question, say so explicitly rather than padding with generic filler\n- Do NOT summarize vaguely - be specific\n- If a passage below starts with a timestamp marker like [2:15], you may reference it in your answer (e.g. \"around 2:15, the video explains...\") so the user knows where to look\n\nVideo context:\n{context}{citation_text}",
                 quality_reason=quality_reason,
                 citations=citations,
                 metadata={"video_count": len(shortlisted_video_ids), "is_time_sensitive": False}
@@ -2812,11 +2908,18 @@ async def chat_with_video_v2(
                 history.append(HumanMessage(content=msg.content))
             elif msg.role == 'assistant':
                 history.append(AIMessage(content=msg.content))
-        
+
+        # Rewrite ambiguous follow-ups ("what about the second part?") into a standalone
+        # question before it's used for retrieval/reasoning - the stored/returned message
+        # still uses the user's original wording, only the agent's working input changes.
+        contextualized_query = contextualize_query(user_input.query, history)
+        if contextualized_query != user_input.query:
+            print(f"[CONTEXTUALIZE] \"{user_input.query}\" -> \"{contextualized_query}\"")
+
         # STEP 5: Create AgentState FIRST (before tool creation and wrapping)
         # Use shared AgentState class
         agent_state = AgentState()
-        
+
         # STEP 6: Create agent tools using factory functions
         youtube_rag_tool_v2 = create_youtube_rag_tool_v2(index, namespace, video_id)
         google_search_tool_v2 = create_google_search_tool_v2(agent_state=agent_state)
@@ -2935,7 +3038,7 @@ async def chat_with_video_v2(
             max_iterations=7,  # Increased to allow proper tool chaining and answer synthesis
             handle_parsing_errors=custom_parse_error_handler,
             callbacks=[tool_tracking_callback],  # Add callback for monitoring
-            early_stopping_method="generate"  # Stop early if agent generates final answer
+            early_stopping_method="force"  # "generate" is unsupported for RunnableAgent (raises ValueError); "force" returns a stopped-response message if max_iterations is hit
         )
 
         # Invoke agent with timeout protection and early stopping monitoring
@@ -2950,7 +3053,7 @@ async def chat_with_video_v2(
                 asyncio.to_thread(
                     agent_executor.invoke,
                     {
-                        "input": user_input.query,
+                        "input": contextualized_query,
                         "chat_history": history
                     }
                 ),
@@ -3007,6 +3110,11 @@ async def chat_with_video_v2(
             if not answer or len(answer.strip()) < 10:
                 print(f"[WARN] Answer too short after extraction, using full output")
                 answer = result.get("output", "I couldn't generate an answer.")
+
+        except ToolCallLimitExceeded as e:
+            execution_time = time.time() - start_time
+            print(f"[STOP] {e} after {execution_time:.2f}s - synthesizing fallback answer instead of exhausting iterations")
+            answer = build_fallback_answer_from_tool_limit(agent_state, contextualized_query)
 
         except asyncio.TimeoutError:
             execution_time = time.time() - start_time
@@ -3191,11 +3299,16 @@ async def chat_general_tab(
                 history.append(HumanMessage(content=msg.content))
             elif msg.role == 'assistant':
                 history.append(AIMessage(content=msg.content))
-        
+
+        # Rewrite ambiguous follow-ups into a standalone question before retrieval/reasoning
+        contextualized_query = contextualize_query(user_input.query, history)
+        if contextualized_query != user_input.query:
+            print(f"[CONTEXTUALIZE] \"{user_input.query}\" -> \"{contextualized_query}\"")
+
         # STEP 5: Create AgentState FIRST (before tool creation and wrapping)
         # Use shared AgentState class
         agent_state = AgentState()
-        
+
         # STEP 6: Create General tab tools using factory functions
         # Create tools - IMPORTANT: Order matters for time-sensitive queries
         # google_search_tool_v2 should be first to prioritize web search for "recent" queries
@@ -3309,7 +3422,7 @@ async def chat_general_tab(
             max_iterations=7,  # Increased to allow proper tool chaining and answer synthesis
             handle_parsing_errors=custom_parse_error_handler,
             callbacks=[tool_tracking_callback],
-            early_stopping_method="generate"  # Stop early if agent generates final answer
+            early_stopping_method="force"  # "generate" is unsupported for RunnableAgent (raises ValueError); "force" returns a stopped-response message if max_iterations is hit
         )
 
         # Run agent with timeout
@@ -3322,7 +3435,7 @@ async def chat_general_tab(
                 asyncio.to_thread(
                     agent_executor.invoke,
                     {
-                        "input": user_input.query,
+                        "input": contextualized_query,
                         "chat_history": history
                     }
                 ),
@@ -3379,6 +3492,11 @@ async def chat_general_tab(
                 print(f"[WARN] Answer too short after extraction, using full output")
                 answer = result.get("output", "I couldn't generate an answer.")
 
+        except ToolCallLimitExceeded as e:
+            execution_time = time.time() - start_time
+            print(f"[STOP] {e} after {execution_time:.2f}s - synthesizing fallback answer instead of exhausting iterations")
+            answer = build_fallback_answer_from_tool_limit(agent_state, contextualized_query)
+
         except asyncio.TimeoutError:
             execution_time = time.time() - start_time
             print(f"[ERROR] General tab execution timed out after {execution_time:.2f} seconds")
@@ -3430,7 +3548,7 @@ async def chat_general_tab(
 
 @app.get("/chat/conversations/{conversation_id}/messages", response_model=List[ConversationMessageResponse])
 async def get_conversation_messages_endpoint(
-    conversation_id: str = Path(..., description="Conversation UUID"),
+    conversation_id: str = FastAPIPath(..., description="Conversation UUID"),
     current_user: dict = Depends(require_scope("write")),
     db: Session = Depends(get_db)
 ):

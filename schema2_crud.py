@@ -30,7 +30,6 @@ from database import (
     ConversationMessage,
     VideosCatalog,
     ResponseEvaluation,
-    UUID_TYPE,
     uuid_default,
 )
 
@@ -389,11 +388,6 @@ def get_recent_messages_for_context(
 
 
 # ============================================================================
-# PINNING OPERATIONS
-# ============================================================================
-
-
-# ============================================================================
 # VIDEOS CATALOG OPERATIONS
 # ============================================================================
 
@@ -537,24 +531,4 @@ def verify_conversation_ownership(
         )
     
     return (True, None)
-
-
-def get_user_conversation_ids(db: Session, user_id: uuid.UUID) -> List[uuid.UUID]:
-    """
-    Get all conversation_ids for a user (for frontend validation).
-    
-    Phase 7.17: Utility function to get all conversation IDs for a user.
-    Useful for frontend validation to ensure only valid conversation_ids are sent.
-    
-    Args:
-        db: Database session
-        user_id: User UUID
-    
-    Returns:
-        List of conversation UUIDs owned by the user
-    """
-    conversations = db.query(VideoConversation).filter(
-        VideoConversation.user_id == user_id
-    ).all()
-    return [c.conversation_id for c in conversations]
 

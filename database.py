@@ -25,8 +25,7 @@ Setup Instructions:
    alembic upgrade head
 """
 import os
-from datetime import datetime, timedelta
-from typing import Optional, List
+from datetime import datetime
 from sqlalchemy import (
     create_engine,
     Column,
@@ -38,8 +37,6 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     CheckConstraint,
-    Index,
-    UniqueConstraint,
 )
 import sqlalchemy as sa
 from sqlalchemy.ext.declarative import declarative_base
